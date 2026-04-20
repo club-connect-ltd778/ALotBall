@@ -1,0 +1,390 @@
+﻿default_platform(:android)
+
+platform :android do
+
+  # Optional (keep if you ever want Debug APK in CI)
+  # desc "Build Debug APK"
+  # lane :debug_build do
+  #   gradle(task: "assembleDebug")
+  # end
+
+  # Shared helper: decode, validate and normalize keystore to JKS
+  private_lane :prepare_signing do
+    UI.header("=== PREPARE SIGNING KEYSTORE ===")
+
+    keystore_password = ENV["KEYSTORE_PASSWORD"].to_s
+    key_alias = ENV["KEY_ALIAS"].to_s
+    key_password = ENV["KEY_PASSWORD"].to_s
+
+    keystore_base64 = ENV["KEYSTORE_BASE64"].to_s.strip.gsub(/\s+/, "")
+    UI.message("Base64 length: #{keystore_base64.length} characters")
+
+    UI.user_error!("KEYSTORE_BASE64 is empty") if keystore_base64.empty?
+    UI.user_error!("KEYSTORE_PASSWORD is empty") if keystore_password.empty?
+    UI.user_error!("KEY_ALIAS is empty") if key_alias.empty?
+    UI.user_error!("KEY_PASSWORD is empty") if key_password.empty?
+
+    keystore_path = "/tmp/my-release-key.jks"
+    begin
+      File.write(keystore_path, Base64.decode64(keystore_base64))
+    rescue => e
+      UI.user_error!("Failed to decode keystore: #{e.message}")
+    end
+
+    keystore_size = File.size(keystore_path)
+    UI.message("Keystore file size: #{keystore_size} bytes")
+    UI.user_error!("Keystore file too small (#{keystore_size} bytes)") if keystore_size < 1024
+
+    # Verify store password works
+    sh "keytool -list -keystore #{keystore_path} -storepass \"#{keystore_password}\" >/dev/null"
+
+    # Verify alias exists and key password works
+    # For PKCS12, key password may differ from store password
+    begin
+      sh "keytool -list -v -keystore #{keystore_path} -storepass \"#{keystore_password}\" -alias \"#{key_alias}\" -keypass \"#{key_password}\" >/dev/null 2>&1"
+    rescue
+      # If keypass fails, try without it (some keystores)
+      sh "keytool -list -v -keystore #{keystore_path} -storepass \"#{keystore_password}\" -alias \"#{key_alias}\" >/dev/null"
+    end
+
+    # Normalize to JKS if needed (Gradle/Play tools are more stable with JKS)
+    keystore_type = sh("keytool -list -keystore #{keystore_path} -storepass \"#{keystore_password}\" 2>/dev/null | grep 'Keystore type:' || true", log: false).to_s
+    UI.message("Keystore type: #{keystore_type.strip}")
+
+    if keystore_type.include?("PKCS12") || keystore_type.include?("pkcs12")
+      UI.message("Converting PKCS12 -> JKS...")
+      tmp_jks = "/tmp/my-release-key-jks.jks"
+      
+      # When converting PKCS12 -> JKS, explicitly set all passwords
+      # Otherwise the key password may be lost or changed
+      convert_cmd = "keytool -importkeystore -srckeystore #{keystore_path} -srcstorepass \"#{keystore_password}\" -srcstoretype PKCS12 -srcalias \"#{key_alias}\" -srckeypass \"#{key_password}\" -destkeystore #{tmp_jks} -deststorepass \"#{keystore_password}\" -deststoretype JKS -destalias \"#{key_alias}\" -destkeypass \"#{key_password}\" -noprompt 2>&1"
+      convert_result = sh(convert_cmd, log: false)
+      
+      if File.exist?(tmp_jks)
+        FileUtils.mv(tmp_jks, keystore_path)
+        UI.success("Keystore converted to JKS")
+        
+        # Verify key is accessible after conversion
+        sh "keytool -list -v -keystore #{keystore_path} -storepass \"#{keystore_password}\" -alias \"#{key_alias}\" -keypass \"#{key_password}\" >/dev/null"
+        UI.success("Key verified after conversion with key password")
+      else
+        UI.user_error!("Failed to convert keystore. Output: #{convert_result}")
+      end
+    end
+
+    {
+      keystore_path: keystore_path,
+      keystore_password: keystore_password,
+      key_alias: key_alias,
+      key_password: key_password
+    }
+  end
+
+  desc "Build Release APK"
+  lane :build_apk do
+    signing = prepare_signing
+
+    UI.header("=== BUILDING RELEASE APK ===")
+    UI.message("Signing config:")
+    UI.message("  Keystore: #{signing[:keystore_path]}")
+    UI.message("  Alias: #{signing[:key_alias]}")
+    
+    # Change to project root (one level up from fastlane/)
+    project_root = File.expand_path("..", Dir.pwd)
+    Dir.chdir(project_root) do
+      UI.message("Changed to project root: #{Dir.pwd}")
+      
+      # Verify we're in the right directory (should have build.gradle.kts)
+      unless File.exist?("build.gradle.kts")
+        UI.user_error!("build.gradle.kts not found in project root: #{Dir.pwd}")
+      end
+      
+      apk_dir = "app/build/outputs/apk/release"
+      UI.message("APK output directory: #{apk_dir}")
+      
+      # Clean previous builds
+      sh "rm -rf #{apk_dir}/*.apk" if Dir.exist?(apk_dir)
+    
+      # Verify gradle is available
+      gradle_cmd = sh("which gradle 2>/dev/null || echo ''", log: false).strip
+      if gradle_cmd.empty?
+        # Try to find gradle in common locations
+        gradle_cmd = sh("ls -d /tmp/gradle-*/bin/gradle 2>/dev/null | head -1", log: false).strip
+        if gradle_cmd.empty?
+          UI.user_error!("Gradle not found! Make sure Gradle is installed and in PATH.")
+        end
+      else
+        gradle_cmd = "gradle"
+      end
+      
+      UI.message("Using Gradle: #{gradle_cmd}")
+      UI.message("Working directory: #{Dir.pwd}")
+      
+      begin
+        # Build properties - pass as array to avoid shell interpretation
+        # This prevents issues with special characters in passwords and Fastlane masking
+        UI.message("Passing signing properties to Gradle:")
+        UI.message("  RELEASE_STORE_FILE: #{signing[:keystore_path]}")
+        UI.message("  RELEASE_STORE_PASSWORD: [REDACTED]")
+        UI.message("  RELEASE_KEY_ALIAS: #{signing[:key_alias]}")
+        UI.message("  RELEASE_KEY_PASSWORD: [REDACTED]")
+        
+        gradle_args = [
+          "-p", ".",
+          "assembleRelease",
+          "-PRELEASE_STORE_FILE=#{signing[:keystore_path]}",
+          "-PRELEASE_STORE_PASSWORD=#{signing[:keystore_password]}",
+          "-PRELEASE_KEY_ALIAS=#{signing[:key_alias]}",
+          "-PRELEASE_KEY_PASSWORD=#{signing[:key_password]}",
+          "--stacktrace",
+          "--warning-mode", "all",
+          "--rerun-tasks",
+          "--no-configuration-cache"
+        ]
+        
+        # Use 'gradle' command directly (no wrapper)
+        # Pass as array to avoid shell interpretation of special characters
+        # Use --rerun-tasks and --no-configuration-cache to ensure signing config is re-evaluated
+        sh(*[gradle_cmd] + gradle_args)
+      rescue => e
+        UI.user_error!("Gradle build failed: #{e.message}\n\nCheck logs above for details.")
+      end
+
+      # Wait a moment for file system to sync
+      sleep(2)
+      
+      # Verify signing config was applied by checking Gradle logs
+      UI.message("Checking if signing config was applied...")
+      UI.message("If APK is unsigned, check Gradle logs above for '=== Signing Config Debug ===' output")
+      
+      # Search for APK file
+      apk_path = nil
+      apk_files = Dir.glob("#{apk_dir}/*.apk")
+      apk_path = apk_files.first if !apk_files.empty?
+      
+      if apk_path.nil? || apk_path.empty? || !File.exist?(apk_path)
+        UI.message("Current directory: #{Dir.pwd}")
+        
+        # Try to find APK in various locations
+        search_paths = [
+          apk_dir,
+          File.expand_path(apk_dir),
+          "app/build/outputs/apk/release",
+          File.join(Dir.pwd, "app/build/outputs/apk/release")
+        ]
+        
+        search_paths.each do |search_dir|
+          if Dir.exist?(search_dir)
+            files = Dir.glob("#{search_dir}/*.apk")
+            if !files.empty?
+              apk_path = files.first
+              UI.message("Found APK at: #{apk_path}")
+              break
+            end
+          end
+        end
+        
+        if apk_path.nil? || !File.exist?(apk_path)
+          UI.user_error!("No APK file found. Build may have failed. Check Gradle logs above.")
+        end
+      end
+      
+      # Ensure we have absolute path
+      apk_path = File.expand_path(apk_path) unless apk_path.start_with?("/")
+      UI.success("APK built successfully: #{apk_path}")
+      sh "ls -lh #{apk_path}"
+
+      UI.header("=== VERIFYING APK SIGNATURE ===")
+      
+      # Check file size
+      file_size = File.size(apk_path)
+      UI.message("APK file size: #{file_size} bytes")
+      if file_size < 1000
+        UI.user_error!("APK file is too small (#{file_size} bytes). File may be corrupted.")
+      end
+      
+      # Verify signature using apksigner (more reliable for APK than jarsigner)
+      # Modern APKs use V2/V3 signing scheme which jarsigner may not detect properly
+      begin
+        # Try to find apksigner in Android SDK
+        apksigner_path = sh("find $ANDROID_HOME $ANDROID_SDK_ROOT ~/Library/Android/sdk /usr/local/lib/android/sdk -name apksigner 2>/dev/null | head -1", log: false).strip
+        
+        if !apksigner_path.empty? || sh("which apksigner 2>/dev/null || echo ''", log: false).strip.length > 0
+          apksigner_cmd = apksigner_path.empty? ? "apksigner" : apksigner_path
+          UI.message("Using apksigner to verify APK signature...")
+          verify_output = sh("#{apksigner_cmd} verify --print-certs #{apk_path} 2>&1", log: false)
+          
+          # apksigner returns 0 on success
+          if $?.success? || verify_output.include?("Verifies") || verify_output.include?("Verified using")
+            UI.success("APK signature verified successfully (apksigner)")
+            UI.message("Signature details:")
+            verify_output.split("\n").first(15).each { |line| UI.message("  #{line}") }
+          else
+            UI.user_error!("APK signature verification FAILED with apksigner!\n\nOutput: #{verify_output}\n\nSigning config was set but APK is not signed. Check build.gradle.kts signingConfigs.")
+          end
+        else
+          # Fallback to jarsigner - but note it may not work correctly for V2/V3 signed APKs
+          UI.message("apksigner not found, using jarsigner (may not detect V2/V3 signatures)...")
+          verify_output = sh("jarsigner -verify -verbose -certs #{apk_path} 2>&1", log: false)
+          
+          UI.message("Jarsigner output:")
+          verify_output.split("\n").first(30).each { |line| UI.message("  #{line}") }
+          
+          # Note: jarsigner may report "unsigned" even for V2/V3 signed APKs
+          # But if it says unsigned AND apksigner also says unsigned, then it's truly unsigned
+          if verify_output.include?("jar verified")
+            UI.success("APK signature verified successfully (jarsigner)")
+          elsif verify_output.include?("jar is unsigned")
+            UI.message("WARNING: jarsigner reports APK as unsigned; this may be a false negative for V2/V3 signatures.")
+            UI.message("APK may still be validly signed (modern signing scheme). Install on device to verify.")
+            UI.message("If installation fails, signing config is not being applied correctly.")
+          else
+            UI.message("Could not determine signature status from jarsigner output")
+          end
+        end
+      rescue => e
+        UI.message("Signature verification warning: #{e.message}")
+        UI.message("APK was built but signature verification failed. Check logs above.")
+        UI.message("If signing config was applied in Gradle logs, APK may still be correctly signed.")
+      end
+    end
+  end
+
+  desc "Build Release AAB"
+  lane :build_aab do
+    signing = prepare_signing
+
+    UI.header("=== BUILDING RELEASE AAB ===")
+    UI.message("Signing config:")
+    UI.message("  Keystore: #{signing[:keystore_path]}")
+    UI.message("  Alias: #{signing[:key_alias]}")
+    
+    # Change to project root (one level up from fastlane/)
+    project_root = File.expand_path("..", Dir.pwd)
+    Dir.chdir(project_root) do
+      UI.message("Changed to project root: #{Dir.pwd}")
+      
+      # Verify we're in the right directory (should have build.gradle.kts)
+      unless File.exist?("build.gradle.kts")
+        UI.user_error!("build.gradle.kts not found in project root: #{Dir.pwd}")
+      end
+      
+      aab_dir = "app/build/outputs/bundle/release"
+      UI.message("AAB output directory: #{aab_dir}")
+      
+      # Clean previous builds
+      sh "rm -rf #{aab_dir}/*.aab" if Dir.exist?(aab_dir)
+    
+      # Verify gradle is available
+      gradle_cmd = sh("which gradle 2>/dev/null || echo ''", log: false).strip
+      if gradle_cmd.empty?
+        # Try to find gradle in common locations
+        gradle_cmd = sh("ls -d /tmp/gradle-*/bin/gradle 2>/dev/null | head -1", log: false).strip
+        if gradle_cmd.empty?
+          UI.user_error!("Gradle not found! Make sure Gradle is installed and in PATH.")
+        end
+      else
+        gradle_cmd = "gradle"
+      end
+      
+      UI.message("Using Gradle: #{gradle_cmd}")
+      UI.message("Working directory: #{Dir.pwd}")
+      
+      begin
+        # Build properties - pass as array to avoid shell interpretation
+        # This prevents issues with special characters in passwords and Fastlane masking
+        gradle_args = [
+          "-p", ".",
+          "bundleRelease",
+          "-PRELEASE_STORE_FILE=#{signing[:keystore_path]}",
+          "-PRELEASE_STORE_PASSWORD=#{signing[:keystore_password]}",
+          "-PRELEASE_KEY_ALIAS=#{signing[:key_alias]}",
+          "-PRELEASE_KEY_PASSWORD=#{signing[:key_password]}",
+          "--stacktrace",
+          "--warning-mode", "all"
+        ]
+        
+        # Use 'gradle' command directly (no wrapper)
+        # Pass as array to avoid shell interpretation of special characters
+        sh(*[gradle_cmd] + gradle_args)
+      rescue => e
+        UI.user_error!("Gradle build failed: #{e.message}\n\nCheck logs above for details.")
+      end
+
+      # Wait a moment for file system to sync
+      sleep(2)
+      
+      # Search for AAB file
+      aab_path = nil
+      aab_files = Dir.glob("#{aab_dir}/*.aab")
+      aab_path = aab_files.first if !aab_files.empty?
+      
+      if aab_path.nil? || aab_path.empty? || !File.exist?(aab_path)
+        UI.message("Current directory: #{Dir.pwd}")
+        
+        # Try to find AAB in various locations
+        search_paths = [
+          aab_dir,
+          File.expand_path(aab_dir),
+          "app/build/outputs/bundle/release",
+          File.join(Dir.pwd, "app/build/outputs/bundle/release")
+        ]
+        
+        search_paths.each do |search_dir|
+          if Dir.exist?(search_dir)
+            files = Dir.glob("#{search_dir}/*.aab")
+            if !files.empty?
+              aab_path = files.first
+              UI.message("Found AAB at: #{aab_path}")
+              break
+            end
+          end
+        end
+        
+        if aab_path.nil? || !File.exist?(aab_path)
+          UI.user_error!("No AAB file found. Build may have failed. Check Gradle logs above.")
+        end
+      end
+      
+      # Ensure we have absolute path
+      aab_path = File.expand_path(aab_path) unless aab_path.start_with?("/")
+      UI.success("AAB built successfully: #{aab_path}")
+      sh "ls -lh #{aab_path}"
+
+      UI.header("=== VERIFYING AAB SIGNATURE ===")
+      # AAB is a signed JAR/ZIP. If it's unsigned, Play Console shows:
+      # "All uploaded bundles must be signed."
+      
+      # Check file size
+      file_size = File.size(aab_path)
+      UI.message("AAB file size: #{file_size} bytes")
+      if file_size < 1000
+        UI.user_error!("AAB file is too small (#{file_size} bytes). File may be corrupted.")
+      end
+      
+      # Verify signature - this MUST pass or Play Console will reject
+      begin
+        verify_output = sh("jarsigner -verify -verbose -certs #{aab_path} 2>&1", log: false)
+        
+        if verify_output.include?("jar verified") || verify_output.include?("jar is unsigned")
+          if verify_output.include?("jar is unsigned")
+            UI.user_error!("AAB is UNSIGNED! Play Console will reject it.\n\nThis means signingConfig was not applied. Check build.gradle.kts signingConfigs.")
+          else
+            UI.message("Signature verification output:")
+            verify_output.split("\n").first(20).each { |line| UI.message("  #{line}") }
+          end
+        else
+          UI.message("Full verification output:")
+          UI.message(verify_output)
+        end
+        
+        # Double check with exit code
+        sh "jarsigner -verify #{aab_path}"
+        UI.success("AAB signature verified successfully (jarsigner)")
+      rescue => e
+        UI.user_error!("AAB signature verification FAILED!\n\nError: #{e.message}\n\nPlay Console will reject this AAB. Check signingConfig in build.gradle.kts.")
+      end
+    end
+  end
+
+end

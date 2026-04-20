@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="white">#FFFFFFFF</color>
+    <color name="black">#000000</color>
+    <color name="splash_background">#252A43</color>
+    <color name="app_bg_dark">#111216</color>
+    <color name="free_generations_accent">#19B562</color>
+    <color name="button_gradient_1">#19B562</color>
+    <color name="button_gradient_2">#19B562</color>
+    <color name="settings_bg_1">#1F2022</color>
+    <color name="settings_bg_2">#526380</color>
+    <color name="settings_bg_3">#526380</color>
+    <color name="input_bg">#727272</color>
+    <color name="overlay_scrim">#AA000000</color>
+</resources>
